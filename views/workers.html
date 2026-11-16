@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="zh-CN">
+<html>
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="pi-plugin-chrome" content="v2" />
-    <title>Workers</title>
+    <title></title>
     <style>
       :root {
         color-scheme: light dark;
@@ -136,17 +136,98 @@
   </head>
   <body>
     <header>
-      <h1>Workers</h1>
-      <button id="refresh" type="button">刷新</button>
+      <h1 id="panel-title"></h1>
+      <button id="refresh" type="button"></button>
     </header>
-    <div class="meta" id="meta">正在读取…</div>
+    <div class="meta" id="meta"></div>
     <ul id="list"></ul>
-    <div class="empty" id="empty" hidden>
-      还没有 worker。让主 agent 用 SessionTask 的 spawn 或 spawnIn 开一个子会话。
-    </div>
+    <div class="empty" id="empty" hidden></div>
     <div class="err" id="err" hidden></div>
     <script>
       "use strict";
+
+      // Every visible string lives in this table, in both locales, so the panel
+      // follows the app language. Values reach the DOM through textContent only.
+      const COPY = {
+        en: {
+          panelTitle: "Workers",
+          refresh: "Refresh",
+          reading: "Reading…",
+          empty: "No workers yet. Ask the main agent to open a sub-session with SessionTask spawn or spawnIn.",
+          openHint: "Open this session",
+          noActivity: "no activity recorded",
+          countLive: "{count} workers | live status {time}",
+          countCached: "{count} workers | cached, refresh for live status",
+          cardDegraded: " | result card degraded: {list}",
+          openFailed: "Cannot open this session: {message}",
+          readFailed: "Read failed: {message}",
+          refreshFailed: "Refresh failed: {message}",
+          refreshPartial: "Some statuses were not refreshed: {message}",
+          statusRunning: "running",
+          statusQueued: "queued",
+          statusWaitingPermission: "waiting for approval",
+          statusCompleted: "completed",
+          statusFailed: "failed",
+          statusCancelled: "cancelled",
+          statusInterrupted: "interrupted",
+          statusIdle: "idle",
+          statusUnknown: "unknown",
+        },
+        "zh-CN": {
+          panelTitle: "子会话",
+          refresh: "刷新",
+          reading: "正在读取…",
+          empty: "还没有 worker。让主 agent 用 SessionTask 的 spawn 或 spawnIn 开一个子会话。",
+          openHint: "打开这个会话",
+          noActivity: "无活动记录",
+          countLive: "{count} 个 worker｜实时状态 {time}",
+          countCached: "{count} 个 worker｜缓存状态，点刷新读取实时状态",
+          cardDegraded: "｜结果卡降级：{list}",
+          openFailed: "打不开这个会话：{message}",
+          readFailed: "读取失败：{message}",
+          refreshFailed: "刷新失败：{message}",
+          refreshPartial: "部分状态未刷新：{message}",
+          statusRunning: "运行中",
+          statusQueued: "排队中",
+          statusWaitingPermission: "等待授权",
+          statusCompleted: "已完成",
+          statusFailed: "失败",
+          statusCancelled: "已取消",
+          statusInterrupted: "已中断",
+          statusIdle: "空闲",
+          statusUnknown: "未知",
+        },
+      };
+
+      const STATUS_KEYS = {
+        running: "statusRunning",
+        queued: "statusQueued",
+        waiting_permission: "statusWaitingPermission",
+        completed: "statusCompleted",
+        failed: "statusFailed",
+        cancelled: "statusCancelled",
+        interrupted: "statusInterrupted",
+        idle: "statusIdle",
+        unknown: "statusUnknown",
+      };
+
+      // Same rule the plugin center applies to the manifest: a zh tag picks the
+      // Chinese table, everything else falls back to English.
+      function detectLocale() {
+        const tag = String(navigator.language || "en").toLowerCase();
+        return tag.indexOf("zh") === 0 ? "zh-CN" : "en";
+      }
+
+      const LOCALE = detectLocale();
+      const TEXT = COPY[LOCALE] || COPY.en;
+      document.documentElement.lang = LOCALE;
+
+      function t(key, values) {
+        const template = String(TEXT[key] ?? COPY.en[key] ?? key);
+        return template.replace(/\{([A-Za-z0-9_]+)\}/g, (match, name) =>
+          values && name in values ? String(values[name]) : match,
+        );
+      }
 
       const bridge = window.pluginBridge;
       const listEl = document.getElementById("list");
@@ -154,6 +235,13 @@
       const emptyEl = document.getElementById("empty");
       const errEl = document.getElementById("err");
       const refreshEl = document.getElementById("refresh");
+      const titleEl = document.getElementById("panel-title");
+
+      document.title = t("panelTitle");
+      titleEl.textContent = t("panelTitle");
+      refreshEl.textContent = t("refresh");
+      metaEl.textContent = t("reading");
+      emptyEl.textContent = t("empty");
 
       function setError(message) {
         errEl.textContent = message || "";
@@ -161,35 +249,26 @@
       }
 
       function statusLabel(value) {
-        return (
-          {
-            running: "运行中",
-            queued: "排队中",
-            waiting_permission: "等待授权",
-            completed: "已完成",
-            failed: "失败",
-            cancelled: "已取消",
-            interrupted: "已中断",
-            idle: "空闲",
-            unknown: "未知",
-          }[value] || value || "未知"
-        );
+        const key = STATUS_KEYS[value];
+        return key ? t(key) : String(value || t("statusUnknown"));
       }
 
       function render(payload) {
         const workers = Array.isArray(payload?.workers) ? payload.workers : [];
         listEl.replaceChildren();
         emptyEl.hidden = workers.length > 0;
-        const channels = payload?.cardChannels && Object.keys(payload.cardChannels).length
-          ? `｜结果卡降级：${Object.entries(payload.cardChannels).map(([k, v]) => `${k}=${v}`).join(", ")}`
+        const degraded = payload?.cardChannels && Object.keys(payload.cardChannels).length
+          ? t("cardDegraded", {
+            list: Object.entries(payload.cardChannels).map(([k, v]) => `${k}=${v}`).join(", "),
+          })
           : "";
         const when = payload?.refreshedAt ? new Date(payload.refreshedAt).toLocaleTimeString() : "";
         metaEl.textContent = workers.length
-          ? `${workers.length} 个 worker${when ? `｜实时状态 ${when}` : "｜缓存状态，点刷新读取实时状态"}${channels}`
+          ? `${when ? t("countLive", { count: workers.length, time: when }) : t("countCached", { count: workers.length })}${degraded}`
           : "";
         for (const worker of workers) {
           const li = document.createElement("li");
-          li.title = "打开这个会话";
+          li.title = t("openHint");
 
           const row = document.createElement("div");
           row.className = "row";
@@ -204,7 +283,7 @@
           const sub = document.createElement("div");
           sub.className = "sub";
           const activity = document.createElement("span");
-          activity.textContent = worker.lastActivity || "无活动记录";
+          activity.textContent = worker.lastActivity || t("noActivity");
           const id = document.createElement("span");
           id.className = "id";
           id.textContent = worker.sessionId;
@@ -233,7 +312,7 @@
         try {
           await bridge.invoke("workers.open", { sessionId });
         } catch (error) {
-          setError(`打不开这个会话：${String(error?.message || error)}`);
+          setError(t("openFailed", { message: String(error?.message || error) }));
         }
       }
 
@@ -242,7 +321,7 @@
         try {
           render(await bridge.invoke("workers.list", {}));
         } catch (error) {
-          setError(`读取失败：${String(error?.message || error)}`);
+          setError(t("readFailed", { message: String(error?.message || error) }));
         }
       }
 
@@ -252,9 +331,9 @@
         try {
           const payload = await bridge.invoke("workers.refresh", {});
           render(payload);
-          if (payload?.error) setError(`部分状态未刷新：${payload.error}`);
+          if (payload?.error) setError(t("refreshPartial", { message: payload.error }));
         } catch (error) {
-          setError(`刷新失败：${String(error?.message || error)}`);
+          setError(t("refreshFailed", { message: String(error?.message || error) }));
         } finally {
           refreshEl.disabled = false;
         }

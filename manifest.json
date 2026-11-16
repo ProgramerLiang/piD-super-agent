@@ -156,7 +156,10 @@
     "views": [
       {
         "id": "workers",
-        "title": "Workers",
+        "title": {
+          "en": "Workers",
+          "zh-CN": "子会话"
+        },
         "icon": "workflow",
         "entry": "views/workers.html",
         "order": 60
