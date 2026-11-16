@@ -196,7 +196,7 @@ downgrade the channel.
 node --test tests/*.test.mjs
 ```
 
-46 tests: the pure card/row helpers; `spawnIn` argument handling, its failure
+66 tests: the pure card/row helpers; `spawnIn` argument handling, its failure
 paths and the delivery-failure row; the event-to-worker mapping (de-duplication,
 cancelled, unsettled, malformed and foreign deliveries); the card delivery
 fallback chain including transient vs permanent refusals; and `main.js` load and

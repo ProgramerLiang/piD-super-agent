@@ -4,7 +4,7 @@
   "name": "Superagent Orchestrator",
   "version": "0.1.0",
   "main": "main.js",
-  "author": "solo-youth-safety-native",
+  "author": "Corripo",
   "description": "Spawn worker sessions in an explicit project, watch them, and land every result in one fixed place.",
   "license": "MIT",
   "engines": {
