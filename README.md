@@ -21,9 +21,11 @@ rewrite.
 
 ## Install
 
-1. PI-Desktop → **Plugins** → **Load development plugin** → pick this directory
-   (`tools/pi-desktop/superagent-orchestrator`). Or build a `.piplug` with the
-   PluginPack tool and install it from the Plugins page.
+1. PI-Desktop → **Plugins** → **Load development plugin** → pick the root of
+   this repository — the directory that contains `manifest.json`, i.e. wherever
+   you cloned `piD-super-agent` (on this machine `/home/crp/piD-super-agent`).
+   Or build a `.piplug` with the PluginPack tool and install it from the
+   Plugins page.
 2. **Approve the permissions in the Plugins page.** The plugin asks for:
 
    | Permission | Why |
