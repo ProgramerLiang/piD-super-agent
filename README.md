@@ -136,7 +136,7 @@ sessionId: 9f31...
 
 1. `git clone https://github.com/ProgramerLiang/piD-super-agent`
 2. PI-Desktop → **Plugins** → **Load development plugin** → 选**仓库根目录**（就是含 `manifest.json` 的那一层，不是 `views/`，也不是上一级）
-3. 在 Plugins 页批准 6 项权限（见第 6 节）。热重载不会自动扩权，改权限必须重新加载。
+3. 在 Plugins 页批准 6 项权限（见第 7 节）。热重载不会自动扩权，改权限必须重新加载。
 
 ### 方式二：打包成 `.piplug` 安装
 
@@ -187,7 +187,7 @@ sessionId: 9f31...
 
 ## 5. Workers 视图
 
-`contributes.views` 注册一个停靠视图 **Workers**（`views/workers.html`）：
+`contributes.views` 注册一个停靠视图 **Workers**（中文界面显示「子会话」，入口 `views/workers.html`）：
 
 - 行来自插件自己的 store：标题、状态、最近活动、项目路径、结果摘要；
 - **刷新**会重读**每一条**缓存行的实时状态（每批 8 个、共享一个 20 s 截止时间），所以刷新不会把列表尾部丢掉；单行读取失败就保留缓存值；活动时间只在宿主真的报了新东西时才动；
