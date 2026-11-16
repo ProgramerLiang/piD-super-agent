@@ -261,3 +261,20 @@ node --test tests/     # 66 个测试
 ## 9. 许可证
 
 MIT，见 [LICENSE](./LICENSE)。
+
+---
+
+## 10. 来源与版权
+
+本插件 fork 自 [vastsa/pi-session-orchestrator](https://github.com/vastsa/pi-session-orchestrator)。
+原始版权归 **vastsa** 所有，沿用上游的 MIT 许可证；[LICENSE](./LICENSE) 原样保留原始版权声明（`Copyright (c) 2026 vastsa`），本仓库未改动。
+
+本 fork 由 **Corripo** 维护，与上游项目没有隶属关系：这里的改动由本仓库独立负责，相关问题请提到本仓库。
+
+**本 fork 相对上游的主要改动**
+
+- 默认异步：`notifyOnCompletion` 默认 `true`，派完就结束本轮，worker 回合结束时结果卡自动回到调用会话。
+- worker 状态契约：解析报告末尾的 `state` / `human_action`，卡片按 `ready` / `blocked` / `failed` 分档渲染，`blocked` 卡片第二行直接写「需要你决定：…」。
+- Workers 视图 i18n：视图标题、名称、描述与安全说明提供 `en` 与 `zh-CN` 两套文案。
+- README 重写：围绕代码实际发布的行为重写，去掉与实现不符的描述。
+- 元数据与测试：更正作者元数据与测试数量，安装说明指向仓库根目录。
