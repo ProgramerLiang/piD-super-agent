@@ -2,7 +2,7 @@
 
 **让主 agent 把任务派给独立的 worker 会话，派完就结束本轮，结果自己回来。**
 
-PI-Desktop 插件 · id `local.superagent-orchestrator` · version `0.1.0` · MIT · 需要 PI-Desktop `>= 0.14.7`（含 Session Collaboration 操作）
+PI-Desktop 插件 · id `corripo.superagent-orchestrator` · version `0.1.1` · MIT · 需要 PI-Desktop `>= 0.14.7`（含 Session Collaboration 操作）
 
 | 你得到 | 说明 |
 | --- | --- |

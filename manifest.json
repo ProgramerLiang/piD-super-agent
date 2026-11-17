@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "local.superagent-orchestrator",
+  "id": "corripo.superagent-orchestrator",
   "name": "Superagent Orchestrator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "main.js",
   "author": "Corripo",
   "description": "Spawn worker sessions in an explicit project, watch them, and land every result in one fixed place.",
