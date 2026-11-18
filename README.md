@@ -1,18 +1,49 @@
 # Superagent Orchestrator
 
-**让主 agent 把任务派给独立的 worker 会话，派完就结束本轮，结果自己回来。**
+**把活派给独立的 worker 会话，派完就结束本轮，结果自己回到会话里。**
 
-PI-Desktop 插件 · id `corripo.superagent-orchestrator` · version `0.1.1` · MIT · 需要 PI-Desktop `>= 0.14.7`（含 Session Collaboration 操作）
+[![version](https://img.shields.io/github/v/tag/ProgramerLiang/piD-super-agent?label=version)](https://github.com/ProgramerLiang/piD-super-agent/tags)
+[![license](https://img.shields.io/github/license/ProgramerLiang/piD-super-agent)](./LICENSE)
+[![plugin id](https://img.shields.io/badge/plugin%20id-corripo.superagent--orchestrator-blueviolet)](https://plugins.aiuo.net/plugins/corripo.superagent-orchestrator)
+[![PI-Desktop](https://img.shields.io/badge/PI--Desktop-%3E%3D0.14.7-6f42c1)](https://github.com/ProgramerLiang/piD-super-agent)
 
-| 你得到 | 说明 |
-| --- | --- |
-| 一个 `SessionTask` 工具 | 12 个 action：`spawnIn` / `spawn` / `send` / `supervise` / `status` / `list` / `result` / `wait` / `accept` / `cancel` / `workers` / `models` |
-| 一个 **Workers** 视图 | 右工作面板里列出这个插件开过的所有 worker：标题、状态、最近活动、项目路径、结果摘要，点一行直接跳到那个会话 |
-| 结果卡 | worker 回合结束时，把结果写回调用会话，并把 worker 自己的 `state` / `human_action` 顶到卡片上 |
+PI-Desktop 插件 · id `corripo.superagent-orchestrator` · 版本 `0.1.1` · MIT（见 [LICENSE](./LICENSE)）· 需要 PI-Desktop `>= 0.14.7`（含 Session Collaboration 操作）
+
+---
+
+## 立即安装
+
+> **在 PI-Desktop 插件中心安装**
+>
+> **<https://plugins.aiuo.net/plugins/corripo.superagent-orchestrator>**
+>
+> 打开发布页安装，按提示批准 6 项权限（见[第 8 节](#8-权限说明)）。上架版本 `0.1.1`，与仓库 `manifest.json` 一致。插件在启动时加载（`activationEvents: ["onStartup"]`），装完即用，没有其他配置项。
+
+其他安装方式（源码加载、自己打包 `.piplug`）见[第 2 节](#2-安装)。
+
+## 目录
+
+- [1. 它解决什么问题](#1-它解决什么问题)
+- [2. 安装](#2-安装)
+- [3. 快速开始](#3-快速开始)
+- [4. 动作总览](#4-动作总览)
+- [5. 核心机制](#5-核心机制)
+- [6. Workers 视图](#6-workers-视图)
+- [7. 已知限制](#7-已知限制)
+- [8. 权限说明](#8-权限说明)
+- [9. 开发与测试](#9-开发与测试)
+- [10. 来源与版权](#10-来源与版权)
+- [11. 社区](#11-社区)
 
 ---
 
 ## 1. 它解决什么问题
+
+| 你得到 | 说明 |
+| --- | --- |
+| 一个 `SessionTask` 工具 | 12 个 action：`spawnIn` / `spawn` / `send` / `supervise` / `status` / `workers` / `wait` / `result` / `accept` / `cancel` / `list` / `models` |
+| 一个 **Workers** 视图 | 右工作面板里列出这个插件开过的所有 worker：标题、状态、最近活动、项目路径、结果摘要，点一行直接跳到那个会话 |
+| 结果卡 | worker 回合结束时，把结果写回调用会话，并把 worker 自己的 `state` / `human_action` 顶到卡片上 |
 
 主 agent 亲自干活会出三种毛病，这个插件逐个对着治：
 
@@ -26,127 +57,31 @@ PI-Desktop 插件 · id `corripo.superagent-orchestrator` · version `0.1.1` · 
 
 ---
 
-## 2. 核心机制
+## 2. 安装
 
-### 2.1 `SessionTask` 的 12 个 action
+### 2.1 插件中心（推荐）
 
-工具在模型侧的名字是 `plugin_local_superagent_orchestrator_SessionTask`（宿主强制前缀 `plugin_<id_safe>_<tool>`）。全部 action 与参数：
+**<https://plugins.aiuo.net/plugins/corripo.superagent-orchestrator>**
 
-| action | 必填 | 可选 | 实际行为 |
-| --- | --- | --- | --- |
-| `spawnIn` | `task` | `title` `projectPath` `model` `notifyOnCompletion` `idempotencyKey` | 用受审的 `session/create` 在 `projectPath` 建会话，再用 `session/collaboration/send` 投递任务。**没有 `projectPath` 就退化为 `spawn`**，回执里带 `degraded: "spawn-no-project-path"` |
-| `spawn` | `task` | `title` `model` `notifyOnCompletion` `idempotencyKey` | 走 `session/collaboration/spawn`，worker 落在**调用者自己的项目**里 |
-| `send` | `sessionId` + `message` | `kind`（`task`/`message`）`notifyOnCompletion` `idempotencyKey` | 向已有会话追加一轮；沿用该会话**已有的模型与上下文**。传 `model` 会被拒（`INVALID_ARGUMENT`） |
-| `supervise` | `sessionIds` + `message` | `notifyOnCompletion` | 一次向最多 **4** 个会话并行投递同一条消息；逐个返回回执，失败进 `failures`。不接受 `idempotencyKey` |
-| `status` | — | `sessionIds` | 读宿主实时状态；不传 `sessionIds` 时读本插件记录、最多 16 条 |
-| `list` | — | — | 宿主会话目录（最多 100 条）+ 本插件 worker 的实时状态 |
-| `result` | `sessionId` | `messageId` `turnId` | 读**一次交付**的状态与最终报告（`ready` / `message.result`） |
-| `wait` | `sessionIds` | `messageId` `turnId` `timeoutMs` | 显式阻塞等待。默认 25 s，上限 45 s，轮询 1 s；超时返回 `timedOut: true` 而不是抛错 |
-| `accept` | `sessionId` 或 `sessionIds` | `messageId` `turnId` `note`（≤4096 字符） | 给一次**已完成且报告非空**的交付打审阅标记；否则 `WORKER_NOT_READY` |
-| `cancel` | `sessionId` | `messageId` | 取消协作工作；**不删除会话** |
-| `workers` | — | `refresh`（默认 `true`） | 本插件的 worker 行；`refresh: false` 只读缓存，零宿主调用 |
-| `models` | — | — | 已配置模型清单 + `automaticCandidates`（允许自动委派的）+ `defaultModel` |
+1. 打开发布页，按页面上的安装入口安装；
+2. PI-Desktop 会提示批准 6 项权限（[第 8 节](#8-权限说明)），逐项确认；
+3. 装完即可用：插件注册 `SessionTask` 工具与 **Workers** 视图，没有其他配置项。
 
-`sessionId` 有兼容别名 `workerId`，`sessionIds` 有别名 `workerIds`；两者同时给出且不一致会报错，不会二选一。
-
-### 2.2 默认异步
-
-```js
-// actions.js
-const DEFAULT_NOTIFY_ON_COMPLETION = true;
-```
-
-```jsonc
-// 默认：派完就结束本轮，结果自己回来
-{ "action": "spawn", "task": "只读审查 src/auth，输出风险清单", "title": "审查 auth" }
-
-// 只有当你决定留在同一轮里自己读结果时，才显式关掉
-{ "action": "spawn", "task": "...", "notifyOnCompletion": false }
-```
-
-`notifyOnCompletion: true` 时，worker 回合结束由**宿主**把完成通知投回调用会话（协作消息，`sourceSessionId` → `targetSessionId`，`completion` 类型只有宿主能生成）。插件自己另有一条独立通道：`session:turnEnded` 事件 → 读回交付 → 生成结果卡（见 2.4）。
-
-两条通道互不依赖，所以「宿主没投通知」不会让结果消失，反过来也一样。
-
-### 2.3 状态契约
-
-派任务时要求 worker 在报告末尾写两行：
-
-```text
-state: ready | blocked | failed
-human_action: none | <要人做的那一件具体的事>
-```
-
-解析在 `cards.js`，规则是「宽进严出」：
-
-| 情况 | 结果 |
-| --- | --- |
-| `**State:** blocked`、`state：blocked`（全角冒号）、`- state: READY` | 都认（容忍 markdown 强调、列表符号、大小写、全角冒号） |
-| `state:` 后面是契约外的词（如 `state: partial`） | **整个契约作废**，回落为普通自由文本卡片，不猜 |
-| 只写了 `state` 没写 `human_action` | `blocked` 仍然是 `blocked`，卡片问「需要你决定」但不编造具体事项 |
-| 完全没写 | 回落为普通卡片，结果照样显示 |
-
-`ready` 不是自我认证：worker 必须在报告里点名自己验证了什么。`blocked` 的 worker 必须点名缺什么。
-
-### 2.4 卡片长什么样、落在哪
-
-```text
-【子会话完成 · 需要你决定】修构建
-需要你决定：批准在 CI 上重跑一次 e2e
-npm run build 通过；e2e 需要生产密钥，我没有。
-项目：/home/crp/proj
-sessionId: 0a2f...
-```
-
-```text
-【子会话完成 · ready】审查 auth
-审查 12 个文件，未发现越权路径；建议补一个 401 用例。
-项目：/home/crp/proj
-sessionId: 9f31...
-```
-
-卡片投递按顺序试，第一个成功的通道生效：
-
-| 顺序 | 宿主 API | 需要授权 | 你会看到 |
-| --- | --- | --- | --- |
-| 1 | `session.appendMessage` | `session.update.all` | 调用会话里一条真正的 assistant 消息（本插件已声明该权限） |
-| 2 | `composer.suggest` | `composer.suggest` | Composer 上方一行可忽略提示，120 s 过期 |
-| 3 | `ui.showToast` | 无 | 应用内 toast |
-
-「被拒」分两类：`PERMISSION_DENIED` / `UNSUPPORTED` / `CONFIRMATION_REQUIRED` 会被记住并在本进程内永久跳过（一次失败，不是每轮失败）；`NOT_FOUND`、超时等视为暂时性，下次还会再试。
-
-同一个 `turnId` 只出一张卡（`cardedTurns` 去重，每个 worker 记 8 个）。**`cancelled` 的回合不写卡片**，只更新行。**未结算的交付不写卡片**：`queued` / `running`、缺 `ready` 标记、读到别的会话的交付、读取失败——都只更新行，绝不把没跑完的东西当成「完成报告」播报。
-
-### 2.5 `spawn` vs `spawnIn`
-
-| | `spawn` | `spawnIn` |
-| --- | --- | --- |
-| 宿主操作 | `session/collaboration/spawn` | `session/create` + `session/collaboration/send` |
-| worker 落在哪 | 调用者自己的项目 | `projectPath` 指定的项目 |
-| 为什么这么做 | 一步到位 | `session/collaboration/spawn` **会丢掉 `projectPath`**，所以必须先建会话再投递 |
-| 失败时 | 直接报错 | `SPAWN_IN_FAILED`（建会话失败，**绝不**回落到调用者项目）/ `DELIVERY_FAILED`（会话建了但任务没投递上，行标为 `failed` 并写明原因，可用 `send` 重试） |
-
-不会静默在错误的 checkout 里跑活——这是 `spawnIn` 存在的全部理由。
-
----
-
-## 3. 安装
-
-### 方式一：从本地目录加载（开发用）
+### 2.2 从源码加载（开发用）
 
 1. `git clone https://github.com/ProgramerLiang/piD-super-agent`
 2. PI-Desktop → **Plugins** → **Load development plugin** → 选**仓库根目录**（就是含 `manifest.json` 的那一层，不是 `views/`，也不是上一级）
-3. 在 Plugins 页批准 6 项权限（见第 7 节）。热重载不会自动扩权，改权限必须重新加载。
+3. 在 Plugins 页批准 6 项权限（见[第 8 节](#8-权限说明)）。热重载不会自动扩权，改权限必须重新加载。
 
-### 方式二：打包成 `.piplug` 安装
+### 2.3 打包成 `.piplug` 安装
 
-用 PI-Desktop 的 **PluginPack** 工具打包，再 **Install plugin package**。`.piplug` 是 store-only（不压缩）zip，用 `zip`/`tar` 手工打的包会被安装器拒绝；本仓库的 `.gitignore` 已排除 `*.piplug`，不要把产物提交进 git。
+先用 **PluginCheck** 校验，再用 **PluginPack** 打包，最后 **Install plugin package** 安装。
 
-插件在启动时加载（`activationEvents: ["onStartup"]`），因为结果卡来自宿主事件而不是工具调用。没有其他配置项。
+`.piplug` 是 store-only（不压缩）zip，用 `zip`/`tar` 手工打的包会被安装器拒绝；本仓库的 `.gitignore` 已排除 `*.piplug`，不要把产物提交进 git。
 
 ---
 
-## 4. 使用示例
+## 3. 快速开始
 
 不需要关键词。工具描述里写清了触发条件：用户说「开个子会话去…」「并行做这两件事」「在另一个项目里跑测试」「子会话跑完了吗」，都算。
 
@@ -167,25 +102,142 @@ sessionId: 9f31...
   "accepted": true, "requestedModel": "provider/model-id", "modelSelection": "delegation" }
 ```
 
-**结果怎么回来**：worker 回合结束时，宿主把完成通知投回本会话，插件同时写一张结果卡（2.4 的两种形状）。**不要**在这中间 `wait` 或 `status` 轮询。
+**结果怎么回来**：worker 回合结束时，宿主把完成通知投回本会话，插件同时写一张结果卡（见 [5.3](#53-结果卡)）。**不要**在这中间 `wait` 或 `status` 轮询。
 
 **在指定项目里派活**
 
 ```jsonc
-{ "action": "spawnIn", "projectPath": "/home/crp/other-repo", "title": "修构建", "task": "…" }
+{
+  "action": "spawnIn",
+  "projectPath": "/home/crp/other-repo",
+  "title": "修构建",
+  "task": "…（同样是自包含的 brief + 状态契约）"
+}
 ```
 
 **人问「现在什么状态」时才读**
 
 ```jsonc
-{ "action": "workers" }                    // 缓存行 + 实时状态
-{ "action": "result", "sessionId": "9f31…" } // 一次交付的确切状态与报告
+{ "action": "workers" }                                        // 缓存行 + 实时状态
+{ "action": "result", "sessionId": "9f31…" }                     // 一次交付的确切状态与报告
 { "action": "wait", "sessionIds": ["9f31…"], "timeoutMs": 30000 } // 显式阻塞，默认 25 s
 ```
 
 ---
 
-## 5. Workers 视图
+## 4. 动作总览
+
+工具在模型侧的名字是 `plugin_corripo_superagent_orchestrator_SessionTask`（宿主强制前缀 `plugin_<id_safe>_<tool>`）。
+
+| action | 作用 | 关键参数 |
+| --- | --- | --- |
+| `spawn` | 走 `session/collaboration/spawn`，worker 落在**调用者自己的项目**里 | 必填 `task`（≤65536）；可选 `title`（≤80）`model` `notifyOnCompletion` `idempotencyKey` |
+| `spawnIn` | 走 `session/create` + `session/collaboration/send`，worker 落在 `projectPath` 指定的项目 | 必填 `task`；可选 `projectPath` `title` `model` `notifyOnCompletion` `idempotencyKey`；没有 `projectPath` 退化为 `spawn` |
+| `send` | 向已有会话追加一轮，沿用该会话**已有的模型与上下文** | 必填 `sessionId` + `message`；可选 `kind`（`task`/`message`）`notifyOnCompletion` `idempotencyKey`；传 `model` 报 `INVALID_ARGUMENT` |
+| `supervise` | 一次向最多 **4** 个会话并行投递同一条消息 | 必填 `sessionIds`（≤4）+ `message`；可选 `notifyOnCompletion`；不接受 `idempotencyKey`；逐个回执，失败进 `failures` |
+| `status` | 读宿主实时状态 | 可选 `sessionIds`（≤16）；不传时读本插件记录 |
+| `workers` | 本插件 worker 行（缓存 + 实时状态） | 可选 `refresh`（默认 `true`；`false` 只读缓存，零宿主调用） |
+| `wait` | 显式阻塞等待一次交付结算 | 必填 `sessionIds`；可选 `messageId` `turnId` `timeoutMs`（默认 25000，上限 45000，轮询 1 s；超时返回 `timedOut: true` 而不抛错） |
+| `result` | 读**一次交付**的状态与最终报告 | 必填 `sessionId`；可选 `messageId` `turnId` |
+| `accept` | 给一次**已完成且报告非空**的交付打审阅标记 | 必填 `sessionId` 或 `sessionIds`；可选 `messageId` `turnId` `note`（≤4096 字符）；不满足条件报 `WORKER_NOT_READY` |
+| `cancel` | 取消协作工作，**不删除会话** | 必填 `sessionId`；可选 `messageId` |
+| `list` | 宿主会话目录（≤100 条）+ 本插件 worker 的实时状态 | 无 |
+| `models` | 已配置模型清单 + `automaticCandidates`（允许自动委派的）+ `defaultModel` | 无 |
+
+`sessionId` 有兼容别名 `workerId`，`sessionIds` 有别名 `workerIds`；两者同时给出且不一致会报错，不会二选一。
+
+---
+
+## 5. 核心机制
+
+### 5.1 默认异步
+
+`notifyOnCompletion` 默认 `true` —— 这是本 fork 相对上游的行为改动（见[第 10 节](#10-来源与版权)）。
+
+```js
+// actions.js
+const DEFAULT_NOTIFY_ON_COMPLETION = true;
+```
+
+```jsonc
+// 默认：派完就结束本轮，结果自己回来
+{ "action": "spawn", "task": "只读审查 src/auth，输出风险清单", "title": "审查 auth" }
+
+// 只有当你决定留在同一轮里自己读结果时，才显式关掉
+{ "action": "spawn", "task": "...", "notifyOnCompletion": false }
+```
+
+`notifyOnCompletion: true` 时，worker 回合结束由**宿主**把完成通知投回调用会话（协作消息，`sourceSessionId` → `targetSessionId`，`completion` 类型只有宿主能生成）。插件自己另有一条独立通道：`session:turnEnded` 事件 → 读回交付 → 生成结果卡（见 5.3）。
+
+两条通道互不依赖，所以「宿主没投通知」不会让结果消失，反过来也一样。
+
+### 5.2 状态契约
+
+派任务时要求 worker 在报告末尾写两行：
+
+```text
+state: ready | blocked | failed
+human_action: none | <要人做的那一件具体的事>
+```
+
+解析在 `cards.js`，规则是「宽进严出」：
+
+| 情况 | 结果 |
+| --- | --- |
+| `**State:** blocked`、`state：blocked`（全角冒号）、`- state: READY` | 都认（容忍 markdown 强调、列表符号、大小写、全角冒号） |
+| `state:` 后面是契约外的词（如 `state: partial`） | **整个契约作废**，回落为普通自由文本卡片，不猜 |
+| 只写了 `state` 没写 `human_action` | `blocked` 仍然是 `blocked`，卡片问「需要你决定」但不编造具体事项 |
+| 完全没写 | 回落为普通卡片，结果照样显示 |
+
+`ready` 不是自我认证：worker 必须在报告里点名自己验证了什么。`blocked` 的 worker 必须点名缺什么。
+
+### 5.3 结果卡
+
+**`blocked` —— 第二行就是「需要你决定什么」**
+
+```text
+【子会话完成 · 需要你决定】修构建
+需要你决定：批准在 CI 上重跑一次 e2e
+npm run build 通过；e2e 需要生产密钥，我没有。
+项目：/home/crp/proj
+sessionId: 0a2f...
+```
+
+**`ready` —— 保持紧凑形状**
+
+```text
+【子会话完成 · ready】审查 auth
+审查 12 个文件，未发现越权路径；建议补一个 401 用例。
+项目：/home/crp/proj
+sessionId: 9f31...
+```
+
+卡片投递按顺序试，第一个成功的通道生效：
+
+| 顺序 | 宿主 API | 需要授权 | 你会看到 |
+| --- | --- | --- | --- |
+| 1 | `session.appendMessage` | `session.update.all` | 调用会话里一条真正的 assistant 消息（本插件已声明该权限） |
+| 2 | `composer.suggest` | `composer.suggest` | Composer 上方一行可忽略提示，120 s 过期 |
+| 3 | `ui.showToast` | 无 | 应用内 toast |
+
+「被拒」分两类：`PERMISSION_DENIED` / `UNSUPPORTED` / `CONFIRMATION_REQUIRED` 会被记住并在本进程内永久跳过（一次失败，不是每轮失败）；`NOT_FOUND`、超时等视为暂时性，下次还会再试。
+
+同一个 `turnId` 只出一张卡（`cardedTurns` 去重，每个 worker 记 8 个）。**`cancelled` 的回合不写卡片**，只更新行。**未结算的交付不写卡片**：`queued` / `running`、缺 `ready` 标记、读到别的会话的交付、读取失败——都只更新行，绝不把没跑完的东西当成「完成报告」播报。
+
+### 5.4 `spawn` 与 `spawnIn`
+
+| | `spawn` | `spawnIn` |
+| --- | --- | --- |
+| 宿主操作 | `session/collaboration/spawn` | `session/create` + `session/collaboration/send` |
+| worker 落在哪 | 调用者自己的项目 | `projectPath` 指定的项目 |
+| 为什么这么做 | 一步到位 | `session/collaboration/spawn` **会丢掉 `projectPath`**，所以必须先建会话再投递 |
+| 失败时 | 直接报错 | `SPAWN_IN_FAILED`（建会话失败，**绝不**回落到调用者项目）/ `DELIVERY_FAILED`（会话建了但任务没投递上，行标为 `failed` 并写明原因，可用 `send` 重试） |
+
+不会静默在错误的 checkout 里跑活——这是 `spawnIn` 存在的全部理由。`projectPath` 只决定 worker 绑到哪个**已存在**的项目，插件**不创建 git worktree、也不隔离工作目录**（见[第 7 节](#7-已知限制)）。
+
+---
+
+## 6. Workers 视图
 
 `contributes.views` 注册一个停靠视图 **Workers**（中文界面显示「子会话」，入口 `views/workers.html`）：
 
@@ -198,15 +250,16 @@ sessionId: 9f31...
 
 ---
 
-## 6. 限制与已知问题
+## 7. 已知限制
 
+- **worker 不能再派生 worker。** 宿主对 worker 发起 `spawn` 会返回 `PERMISSION_DENIED: workers may message existing sessions but cannot create further workers`。
+- **完成通知只在派发时确定。** `notifyOnCompletion` 是 `spawn` / `spawnIn` / `send` / `supervise` 那一次投递的参数，投出去之后没有任何 action 能改它；要换模式只能再发一轮 `send`。`idempotencyKey` 同理，只用于重试同一次投递。
+- **并发有上限，且由宿主强制。** 超限返回 `LIMIT_EXCEEDED: active worker limit reached`。插件自己这一层的上限是明确的：store 最多 128 行、单次最多选 16 个会话、`supervise` 最多 4 个并行投递。宿主侧的活跃 worker 具体数字没有在本仓库代码里出现，也没有官方文档写死，所以这里不复述。
+- **编排层不做 steer。** `agent/steer` 不在插件可调用的操作表里；要改方向只能 `send` 追加一轮，或 `cancel` 后重开。
+- **没有 worktree 隔离。** 插件不能起进程，`spawnIn` 只是把会话绑到一个已存在的项目路径；要隔离就自己先建好 worktree 再指过去。
+- **「编排者不越级执行」是指令，不是宿主级强制隔离。** 它写在工具描述里让模型读，宿主没有、也不会拦着主 agent 自己动手。
 - **契约靠 worker 自觉。** worker 不写 `state` / `human_action`，就只得到普通卡片——结果不丢，但「要不要人决定」这一层信息没有。
 - **状态解析是启发式的。** 只认 `ready` / `blocked` / `failed` 三个词；认不出来就整体回落，不猜。写成 `state: partial` 的 worker 等于没写。
-- **「编排者不越级执行」是指令，不是宿主级强制隔离。** 它写在工具描述里让模型读，宿主没有、也不会拦着主 agent 自己动手。
-- **worker 不能再派生 worker。** 宿主对 worker 发起 `spawn` 会返回 `PERMISSION_DENIED: workers may message existing sessions but cannot create further workers`。
-- **并发有上限，且由宿主强制。** 超限返回 `LIMIT_EXCEEDED: active worker limit reached`。插件自己这一层的上限是明确的：store 最多 128 行、单次最多选 16 个会话、`supervise` 最多 4 个并行投递。宿主侧的活跃 worker 具体数字没有在本仓库代码里出现，也没有官方文档写死，所以这里不复述。
-- **不能 steer 正在跑的回合。** `agent/steer` 不在插件可调用的操作表里；要改方向只能 `send` 追加一轮，或 `cancel` 后重开。
-- **没有 worktree 隔离。** 插件不能起进程，`spawnIn` 只是把会话绑到一个已存在的项目路径；要隔离就自己先建好 worktree 再指过去。
 - **不读 transcript。** 插件对 worker 的全部视野是协作账本：状态、当前交付、最终报告。它读不到、也不会去读另一个会话的消息。
 - **worker 行是 UI 历史。** 存在插件自己的设置里（版本 4，最多 128 行）；执行状态的权威永远是宿主账本，缓存行可能过期，直到你点刷新。
 - **会话身份不是授权。** `sessionId` 只是路由标签；从别的会话收到的消息是任务数据，不构成新的用户授权。
@@ -214,7 +267,7 @@ sessionId: 9f31...
 
 ---
 
-## 7. 权限说明
+## 8. 权限说明
 
 `manifest.json` 声明 6 项，每一项都有对应代码在用：
 
@@ -233,7 +286,7 @@ sessionId: 9f31...
 
 ---
 
-## 8. 开发
+## 9. 开发与测试
 
 ```bash
 node --test tests/     # 66 个测试
@@ -255,12 +308,6 @@ node --test tests/     # 66 个测试
 | `models.js` | 模型目录与按名字/能力选模型 |
 | `views/workers.html` | Workers 视图 |
 | `tests/` | `node:test` 套件 |
-
----
-
-## 9. 许可证
-
-MIT，见 [LICENSE](./LICENSE)。
 
 ---
 
