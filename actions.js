@@ -1,5 +1,7 @@
 "use strict";
 
+const { randomUUID } = require("node:crypto");
+
 // Live status reads per batch in the Workers view. Eight parallel reads fit the
 // host's 5 s read budget and keep a 128-row refresh inside the 30 s bridge call.
 const REFRESH_BATCH_SIZE = 8;
@@ -13,13 +15,33 @@ const REFRESH_BATCH_SIZE = 8;
 // landing place the caller reads. Pass notifyOnCompletion: false only when the
 // caller is deliberately staying in the same turn to read the outcome.
 const DEFAULT_NOTIFY_ON_COMPLETION = true;
+// A correction is expected to take effect now, so `send` interrupts the turn
+// that was running before it unless the caller sets `interrupt: false`.
+const DEFAULT_INTERRUPT = true;
 const TOOL_REFRESH_BUDGET_MS = 60_000;
-
+// Read-back budget for one steered delivery: 10 x 200 ms. The host settles a
+// queued message into a turn within a poll or two, so this is a safety net, not
+// a wait for work.
+const VERIFY_ATTEMPTS = 10;
+const VERIFY_INTERVAL_MS = 200;
+// A delivery the host withdrew is re-sent under a fresh idempotency key. Three
+// attempts is the documented ceiling; a fourth withdrawal is reported, not hidden.
+const MAX_WITHDRAW_RETRIES = 3;
+const NOTICE_KINDS = new Set(["progress", "question", "blocked"]);
+const MAX_NOTICE_CHARS = 8_000;
+const MAX_NOTICE_SUMMARY_CHARS = 300;
+const DEFAULT_NOTIFY_MIN_INTERVAL_MS = 5_000;
+const MAX_NOTIFY_MIN_INTERVAL_MS = 600_000;
+// Statuses in which a session is doing work right now.
+const BUSY_STATUSES = new Set(["running", "waiting_permission"]);
+// What counts as "the new instruction actually reached a turn".
+const STARTED_STATUSES = new Set(["running", "completed", "failed", "interrupted"]);
 
 const {
   MAX_SELECTED_SESSIONS,
   POLL_INTERVAL_MS,
   PREFIX,
+  SESSION_ABORT,
   SESSION_CREATE,
   TERMINAL_STATUSES,
   contextSessionId,
@@ -34,7 +56,7 @@ const {
 } = require("./runtime.js");
 const { MAX_ACCEPTANCE_NOTE_CHARS, MAX_WORKERS } = require("./state.js");
 const { catalog, selectModel } = require("./models.js");
-const { workerRow, workerRows } = require("./cards.js");
+const { collapse, workerRow, workerRows } = require("./cards.js");
 
 function resultSelector(args, sessionId) {
   const messageId = optionalText(args.messageId, "messageId");
@@ -54,8 +76,42 @@ function resultWorker(sessionId, result) {
   };
 }
 
-function createActions(runtime) {
+/**
+ * The marker that separates a worker's mid-turn report from a completion
+ * receipt. The host's completion notice arrives as its own delivery with a
+ * `completion` kind and a result card, so a report that carries this prefix is
+ * never mistaken for one.
+ */
+const NOTICE_MARKER = "[worker-report:";
+
+function noticeKind(value) {
+  if (value === undefined || value === null || value === "") return "progress";
+  if (!NOTICE_KINDS.has(value)) {
+    throw taskError("INVALID_ARGUMENT", "kind for notify must be progress, question or blocked");
+  }
+  return value;
+}
+
+/**
+ * The body of one mid-turn report.
+ *
+ * It names the worker and says it is still running, because the receiving agent
+ * decides whether to steer, wait, or ignore it — and it must not read this as
+ * "the worker is done". `notifyOnCompletion` is false on the delivery itself, so
+ * no completion callback is created for it.
+ */
+function noticeContent({ kind, body, workerSessionId, title }) {
+  return [
+    `${NOTICE_MARKER}${kind}] ${collapse(title) || workerSessionId} (${workerSessionId})`,
+    body,
+    "",
+    "（这是 worker 的中途上报，不是任务完成回执；它此刻仍在运行。要改方向或打断它，用 SessionTask send，interrupt 默认 true。）",
+  ].join("\n");
+}
+
+function createActions(runtime, options = {}) {
   const store = runtime.store;
+  const now = typeof options.now === "function" ? options.now : Date.now;
 
   function withAcceptance(summary, owner) {
     const messageId = summary.currentTask?.messageId || summary.result?.messageId;
@@ -218,6 +274,147 @@ function createActions(runtime) {
     };
   }
 
+  /**
+   * Read the turn a session is running right now, so an interrupt can name it.
+   *
+   * Best effort by design: a status read that fails must not block a delivery
+   * the host would still accept. `undefined` means "unknown", and the caller
+   * reports that instead of guessing at a turn to abort.
+   */
+  async function readActiveTurn(sessionId, ctx) {
+    try {
+      const value = await readStatus(sessionId, { signal: ctx.signal });
+      const turnId = typeof value.currentTask?.turnId === "string" ? value.currentTask.turnId.trim() : "";
+      const messageId = typeof value.currentTask?.messageId === "string" ? value.currentTask.messageId.trim() : "";
+      return { status: value.status, turnId, messageId, active: Boolean(turnId) || BUSY_STATUSES.has(value.status) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Stop the turn that was running *before* the new instruction was delivered.
+   *
+   * Ordering matters more than the mechanism. The host exposes two interrupt
+   * entries, and both can be aimed at one specific target:
+   *
+   *   1. `agent/abort` with the old turn id. The host refuses the request unless
+   *      that id is still the session's active turn (`{aborted:false}`), so a
+   *      turn that already ended — or the turn the new message just started —
+   *      can never be hit by a late arrival of this call.
+   *   2. `session/collaboration/cancel` naming the old *message* id. The host
+   *      only cancels that one queued row and only interrupts the turn bound to
+   *      it.
+   *
+   * A cancel with no message id is the one call that withdraws every queued
+   * row of a session, i.e. the instruction we just delivered before the model
+   * could read it. There is deliberately no path here that reaches it.
+   */
+  async function interruptRunningTurn({ sessionId, turnId, messageId }, ctx) {
+    const attempts = [];
+    const report = (extra) => ({ ...extra, attempts });
+    if (turnId) {
+      try {
+        const value = await runtime.invokeOperation(SESSION_ABORT, [{ sessionId, turnId }], { signal: ctx.signal, read: false });
+        const aborted = value?.aborted !== false && value?.ok !== false;
+        attempts.push({ channel: SESSION_ABORT, ok: aborted, turnId, ...(aborted ? {} : { reason: "turn-not-active" }) });
+        return report(aborted
+          ? { interrupted: true, channel: SESSION_ABORT, turnId }
+          : { interrupted: false, channel: SESSION_ABORT, turnId, reason: "old-turn-already-finished" });
+      } catch (error) {
+        attempts.push({
+          channel: SESSION_ABORT, ok: false,
+          code: error?.code || "UNKNOWN", message: String(error?.message || error).slice(0, 200),
+        });
+      }
+    }
+    if (messageId) {
+      try {
+        await runtime.call("cancel", { sessionId, messageId }, { signal: ctx.signal, read: false });
+        // `cancel` answers `cancelled: true` even when it changed nothing, so the
+        // only evidence that the turn stopped is a fresh status read.
+        const after = await readActiveTurn(sessionId, ctx);
+        const stopped = !after || !after.active || (turnId ? after.turnId !== turnId : true);
+        attempts.push({ channel: "cancel", ok: stopped, messageId, ...(stopped ? {} : { reason: "turn-still-running" }) });
+        return report({
+          interrupted: stopped, channel: "cancel", messageId,
+          ...(turnId ? { turnId } : {}),
+          ...(stopped ? {} : { reason: after ? "turn-still-running" : "unverified" }),
+        });
+      } catch (error) {
+        attempts.push({
+          channel: "cancel", ok: false,
+          code: error?.code || "UNKNOWN", message: String(error?.message || error).slice(0, 200),
+        });
+      }
+    }
+    const last = attempts[attempts.length - 1];
+    return report({ interrupted: false, reason: last ? last.code || last.reason || "interrupt-failed" : "no-target" });
+  }
+
+  /**
+   * Watch one delivery until it leaves `queued`, or the read-back budget ends.
+   *
+   * `cancelled` is the only status that means the instruction never reached the
+   * model: `queued` is still waiting for a turn, `running` and the terminal
+   * statuses all mean it was read.
+   */
+  async function verifyDelivery(sessionId, messageId, ctx) {
+    let last;
+    let readError;
+    for (let attempt = 0; attempt < VERIFY_ATTEMPTS; attempt += 1) {
+      try {
+        const value = await readResult({ sessionId, messageId }, { signal: ctx.signal });
+        last = value?.message;
+        readError = undefined;
+        if (last && last.status !== "queued") {
+          return { status: last.status, turnId: last.turnId || "", verified: true };
+        }
+      } catch (error) {
+        readError = error?.code || "UNKNOWN";
+        if (readError !== "TIMEOUT") break;
+      }
+      if (attempt < VERIFY_ATTEMPTS - 1) {
+        try {
+          await runtime.sleep(VERIFY_INTERVAL_MS, { signal: ctx.signal });
+        } catch {
+          break;
+        }
+      }
+    }
+    return {
+      status: last?.status || "", turnId: last?.turnId || "", verified: false,
+      ...(readError ? { readError } : {}),
+    };
+  }
+
+  /** Carry the caller's retry identity, but never reuse it for a re-delivery. */
+  function attemptKey(base, attempt) {
+    return attempt <= 1 ? base : String(`${base}#r${attempt}`).slice(0, 256);
+  }
+
+  function interruptEnabled(args) {
+    if (args.interrupt === undefined || args.interrupt === null) return DEFAULT_INTERRUPT;
+    if (typeof args.interrupt !== "boolean") throw taskError("INVALID_ARGUMENT", "interrupt must be a boolean");
+    return args.interrupt;
+  }
+
+  /**
+   * Deliver one instruction and, unless the caller opted out, interrupt the turn
+   * that was running before it.
+   *
+   * The sequence is always deliver → interrupt → read back, and the interrupt
+   * can only name the *old* turn or the *old* message. That is what keeps the
+   * new instruction out of the withdrawal race: by the time anything is
+   * interrupted, the instruction is already in the host queue under its own
+   * row, and nothing this function calls touches that row.
+   *
+   * The read-back is the safety net for the case where the host still settles
+   * the new message as `cancelled`: it is then re-delivered under a fresh
+   * idempotency key, up to three attempts, and the caller is told how many
+   * attempts it took (`withdrawnRetried`) instead of being handed a silent
+   * "sent".
+   */
   async function send(args, ctx) {
     const owner = contextSessionId(ctx);
     const sessionId = targetSessionId(args);
@@ -229,18 +426,204 @@ function createActions(runtime) {
     if (args.kind !== undefined && !["task", "message"].includes(args.kind)) {
       throw taskError("INVALID_ARGUMENT", "kind must be task or message");
     }
+    const interrupt = interruptEnabled(args);
+    // A caller may name the turn to interrupt; otherwise the live status does.
+    const hintTurnId = optionalText(args.turnId, "turnId");
     const options = deliveryOptions(args);
-    const receipt = validateDelivery(await runtime.call("send", {
-      sessionId, content, ...(args.kind ? { kind: args.kind } : {}), ...options,
-      notifyOnCompletion: options.notifyOnCompletion ?? DEFAULT_NOTIFY_ON_COMPLETION,
-    }, { signal: ctx.signal, read: false }));
-    if (receipt.sessionId !== sessionId) throw taskError("INTERNAL", "Host returned a delivery for a different session");
+    const callback = options.notifyOnCompletion ?? DEFAULT_NOTIFY_ON_COMPLETION;
+
+    // 1. Name the running turn before anything is queued behind it.
+    const before = interrupt ? await readActiveTurn(sessionId, ctx) : undefined;
+    const oldTurnId = hintTurnId || before?.turnId || "";
+    const oldMessageId = before?.messageId || "";
+    const wantedInterrupt = interrupt && (before ? before.active : Boolean(oldTurnId));
+
+    const baseKey = options.idempotencyKey || `steer-${randomUUID()}`;
+    let receipt;
+    let messageId = "";
+    let interruption;
+    let verification;
+    let attempts = 0;
+    let withdrawnRetried = false;
+    for (let attempt = 1; attempt <= MAX_WITHDRAW_RETRIES; attempt += 1) {
+      attempts = attempt;
+      // 2. Deliver first. The message gets its own row and its own key, so it can
+      // never share an identity with the turn that is about to be interrupted.
+      receipt = validateDelivery(await runtime.call("send", {
+        sessionId, content, ...(args.kind ? { kind: args.kind } : {}),
+        notifyOnCompletion: callback,
+        idempotencyKey: attemptKey(baseKey, attempt),
+      }, { signal: ctx.signal, read: false }));
+      if (receipt.sessionId !== sessionId) throw taskError("INTERNAL", "Host returned a delivery for a different session");
+      messageId = receipt.messageId;
+      // 3. Then interrupt the old turn only, and only once.
+      if (attempt === 1 && wantedInterrupt && (oldTurnId || oldMessageId)) {
+        interruption = await interruptRunningTurn({ sessionId, turnId: oldTurnId, messageId: oldMessageId }, ctx);
+      }
+      // 4. Read the new delivery back: withdrawn means it must be re-sent.
+      verification = await verifyDelivery(sessionId, messageId, ctx);
+      if (verification.status !== "cancelled") break;
+      withdrawnRetried = true;
+    }
+    const status = verification?.status || receipt.status;
+    const delivered = status !== "cancelled";
+    const started = STARTED_STATUSES.has(status);
+    const interruptionReport = interruption || (interrupt ? { interrupted: false, reason: before ? "session-idle" : "status-unavailable" } : undefined);
     const warning = await runtime.remember(sessionId, owner, undefined, {
-      status: receipt.status,
-      lastMessageId: receipt.messageId,
-      lastActivityAt: new Date().toISOString(),
+      status,
+      lastMessageId: messageId,
+      ...(verification?.turnId ? { lastTurnId: verification.turnId } : {}),
+      lastActivityAt: new Date(now()).toISOString(),
     });
-    return { action: "send", ...receipt, accepted: true, ...(warning ? { warning } : {}) };
+    return {
+      action: "send",
+      sessionId,
+      messageId,
+      status,
+      accepted: delivered,
+      delivered,
+      started,
+      interrupted: interruption?.interrupted === true,
+      attempts,
+      withdrawnRetried,
+      verified: verification?.verified === true,
+      interruptRequested: interrupt,
+      ...(verification?.turnId ? { turnId: verification.turnId } : {}),
+      ...(interruptionReport ? { interruption: interruptionReport } : {}),
+      ...(delivered ? {} : { reason: status === "cancelled" ? "withdrawn" : "not-delivered" }),
+      ...(warning ? { warning } : {}),
+    };
+  }
+
+  /**
+   * The session a worker reports to: the one that delegated it.
+   *
+   * The plugin's own row answers first — it is written when the worker is
+   * spawned or first messaged and survives host restarts. The host's own
+   * collaboration provenance is the fallback for a worker this plugin did not
+   * create, and an explicit `sessionId` always wins, because the caller may
+   * know better than either.
+   */
+  async function resolveNoticeTarget(workerSessionId, args, ctx) {
+    const explicit = optionalText(args.sessionId ?? args.workerId, "sessionId");
+    if (explicit) return explicit;
+    const entry = store.get(workerSessionId);
+    const owners = Array.isArray(entry?.referencedBy) ? entry.referencedBy : [];
+    for (let index = owners.length - 1; index >= 0; index -= 1) {
+      const owner = owners[index];
+      if (owner && owner !== workerSessionId) return owner;
+    }
+    let summary;
+    try {
+      summary = await runtime.call("status", { sessionId: workerSessionId }, { signal: ctx.signal });
+    } catch {
+      summary = undefined;
+    }
+    const creator = summary?.createdBySession ?? summary?.creator ?? summary?.provenance?.createdBySession;
+    const candidate = typeof creator === "string"
+      ? creator
+      : creator?.sessionId || creator?.id || summary?.createdBySessionId;
+    const id = typeof candidate === "string" ? candidate.trim() : "";
+    if (id && id !== workerSessionId) return id;
+    throw taskError(
+      "NO_PARENT",
+      "This session has no delegating parent session; pass sessionId to name the recipient",
+      { workerSessionId },
+    );
+  }
+
+  /**
+   * How often one worker may report the same kind.
+   *
+   * Default 5 s, configurable through the plugin setting `notifyMinIntervalMs`
+   * (Settings → Plugins) and overridable per instance for tests.
+   */
+  async function notifyInterval(ctx) {
+    if (Number.isFinite(options.notifyIntervalMs)) {
+      return Math.max(0, Math.min(MAX_NOTIFY_MIN_INTERVAL_MS, Math.floor(options.notifyIntervalMs)));
+    }
+    const settings = await runtime.settings({ signal: ctx.signal });
+    const configured = Number(settings?.notifyMinIntervalMs);
+    if (Number.isFinite(configured) && configured >= 0) {
+      return Math.min(MAX_NOTIFY_MIN_INTERVAL_MS, Math.floor(configured));
+    }
+    return DEFAULT_NOTIFY_MIN_INTERVAL_MS;
+  }
+
+  const lastNotices = new Map();
+
+  /**
+   * Report progress, a question, or a blocker to the delegating session without
+   * ending the caller's own turn.
+   *
+   * The delivery is one ordinary collaboration message in the other direction,
+   * so the caller waits for a single host write and its turn keeps running. It
+   * is explicitly *not* a completion: `notifyOnCompletion` is false, the body
+   * carries the `[worker-report:<kind>]` marker, and the receiving side reads it
+   * as an incoming message rather than as a finished report.
+   *
+   * Repeats of the same kind inside the minimum interval are dropped with
+   * `throttled: true` and a `retryAfterMs`, because a chatty worker must not be
+   * able to flood the delegating session.
+   */
+  async function notify(args, ctx) {
+    const workerSessionId = contextSessionId(ctx);
+    const kind = noticeKind(args.kind);
+    const body = text(args.text ?? args.message, "text", MAX_NOTICE_CHARS);
+    const target = await resolveNoticeTarget(workerSessionId, args, ctx);
+    if (target === workerSessionId) {
+      throw taskError("INVALID_ARGUMENT", "notify cannot target the caller's own session");
+    }
+    const interval = await notifyInterval(ctx);
+    const at = now();
+    const key = `${workerSessionId}\u0000${kind}`;
+    const previous = lastNotices.get(key);
+    if (previous && interval > 0 && at - previous.at < interval) {
+      return {
+        action: "notify",
+        delivered: false,
+        throttled: true,
+        kind,
+        targetSessionId: target,
+        retryAfterMs: Math.max(1, previous.at + interval - at),
+        lastMessageId: previous.messageId,
+        minIntervalMs: interval,
+        note: "同一 worker 同一 kind 的上报还在最小间隔内：这次没有投递。把内容攒到下一条里，或等 retryAfterMs 之后再报。",
+      };
+    }
+    const entry = store.get(workerSessionId);
+    const receipt = validateDelivery(await runtime.call("send", {
+      sessionId: target,
+      content: noticeContent({ kind, body, workerSessionId, title: entry?.title }),
+      kind: "message",
+      notifyOnCompletion: false,
+      idempotencyKey: `notice-${randomUUID()}`,
+    }, { signal: ctx.signal, read: false }));
+    if (receipt.sessionId !== target) throw taskError("INTERNAL", "Host returned a delivery for a different session");
+    lastNotices.set(key, { at, messageId: receipt.messageId });
+    try {
+      await store.update(workerSessionId, {
+        lastNotice: body.slice(0, MAX_NOTICE_SUMMARY_CHARS),
+        lastNoticeAt: new Date(at).toISOString(),
+        lastNoticeKind: kind,
+      });
+    } catch {
+      // The report already landed; a settings write failure is UI history only.
+    }
+    return {
+      action: "notify",
+      delivered: true,
+      throttled: false,
+      kind,
+      targetSessionId: target,
+      messageId: receipt.messageId,
+      status: receipt.status,
+      notifyOnCompletion: false,
+      minIntervalMs: interval,
+      note: receipt.status === "queued"
+        ? "上报已进入父会话队列（它在忙时排队等待），你的回合不受影响，继续干活。"
+        : "上报已投递给父会话，你的回合继续。",
+    };
   }
 
   async function status(args, ctx, action = "status") {
@@ -486,6 +869,7 @@ function createActions(runtime) {
       case "spawn": return spawn(args, ctx);
       case "spawnIn": return spawnIn(args, ctx);
       case "send": return send(args, ctx);
+      case "notify": return notify(args, ctx);
       case "status": return status(args, ctx);
       case "list": return list(args, ctx);
       case "result": return result(args, ctx);
@@ -502,8 +886,7 @@ function createActions(runtime) {
       default: throw taskError("INVALID_ARGUMENT", `Unsupported SessionTask action: ${action}`);
     }
   }
-
   return { execute, refreshWorkers, readStatus, applyStatus };
 }
 
-module.exports = { createActions, resultSelector, resultWorker };
+module.exports = { NOTICE_MARKER, createActions, noticeContent, noticeKind, resultSelector, resultWorker };

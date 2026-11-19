@@ -7,7 +7,7 @@
 [![plugin id](https://img.shields.io/badge/plugin%20id-corripo.superagent--orchestrator-blueviolet)](https://plugins.aiuo.net/plugins/corripo.superagent-orchestrator)
 [![PI-Desktop](https://img.shields.io/badge/PI--Desktop-%3E%3D0.14.7-6f42c1)](https://github.com/ProgramerLiang/piD-super-agent)
 
-PI-Desktop 插件 · id `corripo.superagent-orchestrator` · 版本 `0.1.1` · MIT（见 [LICENSE](./LICENSE)）· 需要 PI-Desktop `>= 0.14.7`（含 Session Collaboration 操作）
+PI-Desktop 插件 · id `corripo.superagent-orchestrator` · 版本 `0.2.0` · MIT（见 [LICENSE](./LICENSE)）· 需要 PI-Desktop `>= 0.14.7`（含 Session Collaboration 操作）
 
 ---
 
@@ -17,7 +17,7 @@ PI-Desktop 插件 · id `corripo.superagent-orchestrator` · 版本 `0.1.1` · M
 >
 > **<https://plugins.aiuo.net/plugins/corripo.superagent-orchestrator>**
 >
-> 打开发布页安装，按提示批准 6 项权限（见[第 8 节](#8-权限说明)）。上架版本 `0.1.1`，与仓库 `manifest.json` 一致。插件在启动时加载（`activationEvents: ["onStartup"]`），装完即用，没有其他配置项。
+> 打开发布页安装，按提示批准 6 项权限（见[第 8 节](#8-权限说明)）。上架版本 `0.2.0`，与仓库 `manifest.json` 一致。插件在启动时加载（`activationEvents: ["onStartup"]`），装完即用，没有其他配置项。
 
 其他安装方式（源码加载、自己打包 `.piplug`）见[第 2 节](#2-安装)。
 
@@ -133,7 +133,8 @@ PI-Desktop 插件 · id `corripo.superagent-orchestrator` · 版本 `0.1.1` · M
 | --- | --- | --- |
 | `spawn` | 走 `session/collaboration/spawn`，worker 落在**调用者自己的项目**里 | 必填 `task`（≤65536）；可选 `title`（≤80）`model` `notifyOnCompletion` `idempotencyKey` |
 | `spawnIn` | 走 `session/create` + `session/collaboration/send`，worker 落在 `projectPath` 指定的项目 | 必填 `task`；可选 `projectPath` `title` `model` `notifyOnCompletion` `idempotencyKey`；没有 `projectPath` 退化为 `spawn` |
-| `send` | 向已有会话追加一轮，沿用该会话**已有的模型与上下文** | 必填 `sessionId` + `message`；可选 `kind`（`task`/`message`）`notifyOnCompletion` `idempotencyKey`；传 `model` 报 `INVALID_ARGUMENT` |
+| `send` | 向已有会话投递一轮；默认**先投递，再打断旧轮次**，沿用该会话**已有的模型与上下文** | 必填 `sessionId` + `message`；可选 `kind`（`task`/`message`）`notifyOnCompletion` `idempotencyKey` `interrupt`（默认 `true`，设 `false` 退回排队）；传 `model` 报 `INVALID_ARGUMENT` |
+| `notify` | worker 中途向派生它的父会话上报进度/提问/受阻，**不结束也不打断自己的回合** | 必填 `text`；可选 `kind`（`progress`/`question`/`blocked`）`sessionId`；同一 worker+kind 默认最少间隔 5000 ms（插件设置 `notifyMinIntervalMs` 可调） |
 | `supervise` | 一次向最多 **4** 个会话并行投递同一条消息 | 必填 `sessionIds`（≤4）+ `message`；可选 `notifyOnCompletion`；不接受 `idempotencyKey`；逐个回执，失败进 `failures` |
 | `status` | 读宿主实时状态 | 可选 `sessionIds`（≤16）；不传时读本插件记录 |
 | `workers` | 本插件 worker 行（缓存 + 实时状态） | 可选 `refresh`（默认 `true`；`false` 只读缓存，零宿主调用） |
@@ -170,6 +171,21 @@ const DEFAULT_NOTIFY_ON_COMPLETION = true;
 `notifyOnCompletion: true` 时，worker 回合结束由**宿主**把完成通知投回调用会话（协作消息，`sourceSessionId` → `targetSessionId`，`completion` 类型只有宿主能生成）。插件自己另有一条独立通道：`session:turnEnded` 事件 → 读回交付 → 生成结果卡（见 5.3）。
 
 两条通道互不依赖，所以「宿主没投通知」不会让结果消失，反过来也一样。
+
+### 5.2 打断式指令与中途上报
+
+`send` 的 `interrupt` 默认 `true`：发给正在运行的 worker 时，新指令不再排到它那轮结束之后。实现顺序是固定的：
+
+1. 先用**新的** `idempotencyKey` 投递新指令，记下返回的 `messageId`；
+2. 只针对投递前观察到的**旧轮**调用 `agent/abort`（带旧 `turnId`）；宿主只在那个 turn 仍是活跃轮时才执行，晚到的调用拿到 `{aborted:false}` 就停手；`agent/abort` 不可用时降级为带**旧 messageId** 的 `session/collaboration/cancel`；
+3. 回查新消息的 `status` 与 `turn_id`（200 ms × 至多 10 次）。若新消息被撤回（`cancelled`），用**新的幂等键**重投，最多 3 次；
+4. 返回 `{delivered, interrupted, messageId, turnId, attempts, withdrawnRetried}`。三次都被撤回时 `delivered:false` + `reason:"withdrawn"`，不会报一个假的「已发送」。
+
+**为什么先投递后打断：** 在模型回复任何内容之前取消，宿主会撤回那一轮的消息；如果先 `cancel` 再 `send`，刚发的指令本身可能被一起撤回。先落一条独立的消息行，再只点名旧 turn/旧 message，任何一步都没有指向新消息的 id；回查与重投则兜住宿主仍然撤回新消息的竞态。**这里从不调用不带 `messageId` 的 `cancel`** —— 它会把所有排队消息一起取消，正好包括刚投递的指令。
+
+`interrupt:false` 恢复旧行为：消息进宿主队列，等当前轮结束才被读到。
+
+worker 侧的 `notify` 走反方向的普通协作消息：目标由 worker 的委派来源自动反查（本插件记录优先，宿主 provenance 兜底，也可显式 `sessionId` 指定）。正文带 `[worker-report:<kind>]` 标记，并明确写「不是任务完成回执；它此刻仍在运行」；`notifyOnCompletion:false`，所以不会生成完成回调。调用返回后 worker 的当前轮**继续运行**。主会话收到的是一条普通 incoming 消息，与 `completion` 类型的完成通知和结果卡分开。同一 worker 同一 `kind` 在最小间隔（默认 5000 ms，插件设置 `notifyMinIntervalMs` 可调，上限 600000）内重复调用会返回 `throttled:true` + `retryAfterMs`，不再投递。
 
 ### 5.2 状态契约
 
@@ -255,7 +271,7 @@ sessionId: 9f31...
 - **worker 不能再派生 worker。** 宿主对 worker 发起 `spawn` 会返回 `PERMISSION_DENIED: workers may message existing sessions but cannot create further workers`。
 - **完成通知只在派发时确定。** `notifyOnCompletion` 是 `spawn` / `spawnIn` / `send` / `supervise` 那一次投递的参数，投出去之后没有任何 action 能改它；要换模式只能再发一轮 `send`。`idempotencyKey` 同理，只用于重试同一次投递。
 - **并发有上限，且由宿主强制。** 超限返回 `LIMIT_EXCEEDED: active worker limit reached`。插件自己这一层的上限是明确的：store 最多 128 行、单次最多选 16 个会话、`supervise` 最多 4 个并行投递。宿主侧的活跃 worker 具体数字没有在本仓库代码里出现，也没有官方文档写死，所以这里不复述。
-- **编排层不做 steer。** `agent/steer` 不在插件可调用的操作表里；要改方向只能 `send` 追加一轮，或 `cancel` 后重开。
+- **没有独立的 steer 操作。** `agent/steer` 不在插件可调用的操作表里；`send` 的 `interrupt:true` 是用「先投递 + 只打断旧轮 + 回查重投」组合出来的等价能力，不是把文本插进正在生成的上下文。
 - **没有 worktree 隔离。** 插件不能起进程，`spawnIn` 只是把会话绑到一个已存在的项目路径；要隔离就自己先建好 worktree 再指过去。
 - **「编排者不越级执行」是指令，不是宿主级强制隔离。** 它写在工具描述里让模型读，宿主没有、也不会拦着主 agent 自己动手。
 - **契约靠 worker 自觉。** worker 不写 `state` / `human_action`，就只得到普通卡片——结果不丢，但「要不要人决定」这一层信息没有。
@@ -289,17 +305,17 @@ sessionId: 9f31...
 ## 9. 开发与测试
 
 ```bash
-node --test tests/     # 66 个测试
+node --test tests/     # 80 个测试
 ```
 
-覆盖：纯函数卡片/行渲染、`spawnIn` 的参数处理与失败路径、事件到 worker 的映射（去重、取消、未结算、畸形、他人交付）、卡片投递降级链（暂时性 vs 永久性拒绝）、`main.js` 在假宿主上的加载/卸载（含历史写入失败）。
+覆盖：消息状态机与撤回重投、worker 上报限流、纯函数卡片/行渲染、`spawnIn` 的参数处理与失败路径、事件到 worker 的映射（去重、取消、未结算、畸形、他人交付）、卡片投递降级链（暂时性 vs 永久性拒绝）、`main.js` 在假宿主上的加载/卸载（含历史写入失败）。
 
 打包前用 **PluginCheck** 校验，用 **PluginPack** 出 `.piplug`。
 
 | 文件 | 职责 |
 | --- | --- |
 | `main.js` | 加载/卸载、注册工具、启动 watcher、视图的 `onPanelInvoke` |
-| `actions.js` | 12 个 `SessionTask` action |
+| `actions.js` | 13 个 `SessionTask` action（含 `send` 打断式投递与 `notify`） |
 | `runtime.js` | 带 abort 的 `desktop.invoke` / 宿主 API 网关，超时与预算 |
 | `state.js` | 插件设置里的有界 worker store（settings version 4） |
 | `watcher.js` | `session:turnEnded` → 读回交付 → 结果卡 |

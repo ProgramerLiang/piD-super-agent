@@ -5,6 +5,11 @@ const PREFIX = "session/collaboration/";
 // risk and neither requires `confirm: true`.
 const SESSION_CREATE = "session/create";
 const SESSION_OPEN = "session/open";
+// The only interrupt entry the host exposes to a plugin: `agent/abort` is a
+// reviewed `write` operation whose request names the session and, optionally,
+// the turn. With a turn id the host refuses the call unless that turn is still
+// the session's active turn, which is what makes "interrupt the old turn" safe.
+const SESSION_ABORT = "agent/abort";
 const READ_TIMEOUT_MS = 5_000;
 const MAX_SELECTED_SESSIONS = 16;
 const MAX_WAIT_TIMEOUT_MS = 45_000;
@@ -232,6 +237,20 @@ function createRuntime(store, api = pi) {
     callHost,
     call: (action, input, options) => invoke(PREFIX + action, input, options),
     models: (options) => bounded(() => api.models.list(), options),
+    /**
+     * The plugin's own settings object. A missing host API or a failing read is
+     * not fatal: every caller has a documented default.
+     */
+    async settings(options) {
+      if (!api.plugin?.getSettings) return {};
+      try {
+        const value = await bounded(() => api.plugin.getSettings(), options);
+        return value && typeof value === "object" ? value : {};
+      } catch (error) {
+        if (error?.code === "ABORTED") throw error;
+        return {};
+      }
+    },
     remember,
     async sleep(ms, options) {
       let timer;
@@ -254,6 +273,7 @@ module.exports = {
   WAIT_TIMEOUT_MS,
   POLL_INTERVAL_MS,
   PREFIX,
+  SESSION_ABORT,
   SESSION_CREATE,
   SESSION_OPEN,
   TERMINAL_STATUSES,
