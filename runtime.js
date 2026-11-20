@@ -5,6 +5,7 @@ const PREFIX = "session/collaboration/";
 // risk and neither requires `confirm: true`.
 const SESSION_CREATE = "session/create";
 const SESSION_OPEN = "session/open";
+const SESSION_CONFIGURE = "session/configure";
 // The only interrupt entry the host exposes to a plugin: `agent/abort` is a
 // reviewed `write` operation whose request names the session and, optionally,
 // the turn. With a turn id the host refuses the call unless that turn is still
@@ -274,6 +275,7 @@ module.exports = {
   POLL_INTERVAL_MS,
   PREFIX,
   SESSION_ABORT,
+  SESSION_CONFIGURE,
   SESSION_CREATE,
   SESSION_OPEN,
   TERMINAL_STATUSES,

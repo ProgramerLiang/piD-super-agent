@@ -42,6 +42,7 @@ const {
   POLL_INTERVAL_MS,
   PREFIX,
   SESSION_ABORT,
+  SESSION_CONFIGURE,
   SESSION_CREATE,
   TERMINAL_STATUSES,
   contextSessionId,
@@ -566,6 +567,72 @@ function createActions(runtime, options = {}) {
    * `throttled: true` and a `retryAfterMs`, because a chatty worker must not be
    * able to flood the delegating session.
    */
+  async function setModel(args, ctx) {
+    contextSessionId(ctx);
+    const sessionId = targetSessionId(args);
+    const models = await runtime.models({ signal: ctx.signal });
+    const modelInput = optionalText(args.model, "model", 512);
+    const explicitProvider = optionalText(args.providerId, "providerId", 256);
+    const explicitModel = optionalText(args.modelId, "modelId", 256);
+    const selected = modelInput ? selectModel(models, modelInput) : undefined;
+    const providerId = explicitProvider || selected?.model.providerId;
+    const modelId = explicitModel || selected?.model.modelId;
+    if (!providerId || !modelId) {
+      throw taskError("INVALID_ARGUMENT", "setModel requires a model, or both providerId and modelId");
+    }
+    const catalogRow = catalog(models).find((row) => row.providerId === providerId && row.modelId === modelId);
+    if (!catalogRow) throw taskError("MODEL_NOT_FOUND", "The target is not a ready configured model", { providerId, modelId });
+    const entry = store.get(sessionId);
+    if (!entry) {
+      throw taskError("WORKER_NOT_FOUND", "setModel targets a session this plugin tracks; spawn it first", { sessionId });
+    }
+    const live = await readStatus(sessionId, { signal: ctx.signal });
+    if (BUSY_STATUSES.has(live.status) || live.currentTask?.turnId) {
+      throw taskError("SESSION_BUSY", "Cannot switch model while the worker has a running turn; wait for it to settle, or interrupt and re-send the task explicitly", {
+        sessionId, status: live.status, turnId: live.currentTask?.turnId || "",
+      });
+    }
+    const thinkingLevel = optionalText(args.thinkingLevel, "thinkingLevel", 32);
+    if (thinkingLevel && !(catalogRow.thinkingLevels || []).includes(thinkingLevel)) {
+      throw taskError("INVALID_ARGUMENT", "thinkingLevel is not supported by the selected model", {
+        thinkingLevel, supported: catalogRow.thinkingLevels || [],
+      });
+    }
+    await runtime.ensureOperation(SESSION_CONFIGURE, { signal: ctx.signal });
+    const before = {
+      providerId: String(live.providerId || ""),
+      modelId: String(live.modelId || ""),
+      thinkingLevel: String(live.thinkingLevel || ""),
+    };
+    const configured = await runtime.invokeOperation(SESSION_CONFIGURE, [sessionId, {
+      providerId, modelId, ...(thinkingLevel ? { thinkingLevel } : {}),
+    }], { signal: ctx.signal, read: false, confirm: true });
+    const session = configured?.session || configured?.result?.session;
+    const after = session ? {
+      providerId: String(session.providerId || ""),
+      modelId: String(session.modelId || ""),
+      thinkingLevel: String(session.thinkingLevel || ""),
+    } : undefined;
+    const afterStatus = await readStatus(sessionId, { signal: ctx.signal });
+    if (afterStatus.providerId !== providerId || afterStatus.modelId !== modelId || (thinkingLevel && afterStatus.thinkingLevel !== thinkingLevel)) {
+      throw taskError("MODEL_CHANGE_UNVERIFIED", "The host configure call did not persist the requested model on a fresh status read; do not assume the switch took effect", {
+        sessionId, requested: { providerId, modelId, ...(thinkingLevel ? { thinkingLevel } : {}) }, reported: {
+          providerId: afterStatus.providerId || "", modelId: afterStatus.modelId || "", thinkingLevel: afterStatus.thinkingLevel || "",
+        },
+      });
+    }
+    await store.update(sessionId, { lastActivityAt: new Date(now()).toISOString() });
+    return {
+      action: "setModel",
+      sessionId,
+      requested: { providerId, modelId, ...(thinkingLevel ? { thinkingLevel } : {}) },
+      before,
+      applied: after,
+      verified: true,
+      note: "session/configure is dangerous: the host requires confirm:true and shows its own native Allow once / Deny dialog. If you denied it, the call fails with PERMISSION_DENIED and nothing was changed. The session was idle; no turn was interrupted and no task was re-sent. Send the next task normally and it uses the new model.",
+    };
+  }
+
   async function notify(args, ctx) {
     const workerSessionId = contextSessionId(ctx);
     const kind = noticeKind(args.kind);
@@ -870,6 +937,7 @@ function createActions(runtime, options = {}) {
       case "spawnIn": return spawnIn(args, ctx);
       case "send": return send(args, ctx);
       case "notify": return notify(args, ctx);
+      case "setModel": return setModel(args, ctx);
       case "status": return status(args, ctx);
       case "list": return list(args, ctx);
       case "result": return result(args, ctx);
