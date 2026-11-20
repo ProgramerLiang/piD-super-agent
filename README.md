@@ -135,6 +135,7 @@ PI-Desktop 插件 · id `corripo.superagent-orchestrator` · 版本 `0.2.0` · M
 | `spawnIn` | 走 `session/create` + `session/collaboration/send`，worker 落在 `projectPath` 指定的项目 | 必填 `task`；可选 `projectPath` `title` `model` `notifyOnCompletion` `idempotencyKey`；没有 `projectPath` 退化为 `spawn` |
 | `send` | 向已有会话投递一轮；默认**先投递，再打断旧轮次**，沿用该会话**已有的模型与上下文** | 必填 `sessionId` + `message`；可选 `kind`（`task`/`message`）`notifyOnCompletion` `idempotencyKey` `interrupt`（默认 `true`，设 `false` 退回排队）；传 `model` 报 `INVALID_ARGUMENT` |
 | `notify` | worker 中途向派生它的父会话上报进度/提问/受阻，**不结束也不打断自己的回合** | 必填 `text`；可选 `kind`（`progress`/`question`/`blocked`）`sessionId`；同一 worker+kind 默认最少间隔 5000 ms（插件设置 `notifyMinIntervalMs` 可调） |
+| `setModel` | 给**本插件已跟踪、当前空闲**的 worker 切换 provider/model，保留项目与会话上下文 | 必填 `sessionId` + `model`（key/别名）或 `providerId`+`modelId` 成对；可选 `thinkingLevel`；详见 [5.5](#55-setmodel换模型) |
 | `supervise` | 一次向最多 **4** 个会话并行投递同一条消息 | 必填 `sessionIds`（≤4）+ `message`；可选 `notifyOnCompletion`；不接受 `idempotencyKey`；逐个回执，失败进 `failures` |
 | `status` | 读宿主实时状态 | 可选 `sessionIds`（≤16）；不传时读本插件记录 |
 | `workers` | 本插件 worker 行（缓存 + 实时状态） | 可选 `refresh`（默认 `true`；`false` 只读缓存，零宿主调用） |
@@ -250,6 +251,25 @@ sessionId: 9f31...
 | 失败时 | 直接报错 | `SPAWN_IN_FAILED`（建会话失败，**绝不**回落到调用者项目）/ `DELIVERY_FAILED`（会话建了但任务没投递上，行标为 `failed` 并写明原因，可用 `send` 重试） |
 
 不会静默在错误的 checkout 里跑活——这是 `spawnIn` 存在的全部理由。`projectPath` 只决定 worker 绑到哪个**已存在**的项目，插件**不创建 git worktree、也不隔离工作目录**（见[第 7 节](#7-已知限制)）。
+
+### 5.5 `setModel` 换模型
+
+`setModel` 给**本插件已跟踪**的 worker 会话切换 provider/model，保留该会话的项目绑定与上下文。它不打断任何轮次，不重发任务，也不改已经发出的消息；切换成功后，**下一条 `send` 的任务**才使用新模型。
+
+```jsonc
+// 用模型 key/别名
+{ "action": "setModel", "sessionId": "9f31…", "model": "provider/model-id" }
+
+// 或显式成对指定；可选 thinkingLevel（必须在该模型支持列表里）
+{ "action": "setModel", "sessionId": "9f31…", "providerId": "provider", "modelId": "model-id", "thinkingLevel": "low" }
+```
+
+行为与边界：
+
+- **前置条件**：目标会话必须空闲（没有 running turn）。忙碌时返回 `SESSION_BUSY: Cannot switch model while the worker has a running turn`，此时应先等它那轮结束；要立即停下旧轮，用 `send` 的 `interrupt:true`，但不要把“打断”和“改模型”串成自动动作。
+- **宿主确认**：底层走 `session/configure`，宿主把它标记为 **dangerous**。插件调用时带 `confirm:true`，但宿主仍会弹自己的原生「Allow once / Deny」对话框，必须真人点确认；点 Deny 或关闭对话框都会返回 `PERMISSION_DENIED`，任何状态都不会改变。
+- **目标校验**：`model` 按 `models` action 的同一份已配置模型清单解析；显式 `providerId`+`modelId` 也必须命中 ready 配置。未配置或不匹配返回 `MODEL_NOT_FOUND`；参数不全返回 `INVALID_ARGUMENT`。
+- **失败模式**：非本插件跟踪的会话返回 `WORKER_NOT_FOUND`；busy 返回 `SESSION_BUSY`。configure 调用返回后会再读一次宿主状态，只有 `providerId`/`modelId`（以及传了的 `thinkingLevel`）都与请求一致，才返回 `verified:true`；不一致报 `MODEL_CHANGE_UNVERIFIED`，不会把“请求已发出”当成功。
 
 ---
 
